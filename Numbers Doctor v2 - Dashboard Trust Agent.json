@@ -1,0 +1,506 @@
+{
+  "name": "Numbers Doctor v2 - Dashboard Trust Agent",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "af2cd32a-0d5d-484a-9d10-5733562731d9",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "a1",
+              "name": "case_id",
+              "value": 4,
+              "type": "number"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "5c02ef98-b78e-419b-ad10-4cd005e9a093",
+      "name": "Pick Case (0-10)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        224,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ================= Numbers Doctor v2 - shared library =================\n// This exact text is embedded in the n8n Code node and in the three agent tools.\n//\n// DATA ADAPTER CONTRACT: loadData(caseId) must return three arrays:\n//   source:     { order_id, date, region, currency, amount_local, amount_usd }   (system of record)\n//   dashboard:  { order_id, date, region, amount_usd }                           (what the dashboard / BI export shows)\n//   refreshLog: { date, region, status }                                         (load-job log)\n// Default adapter = built-in sample data with seeded faults. Any BI tool that can export CSV\n// (Power BI, Tableau, SAC, Excel) can feed the same three shapes.\n\nconst REGIONS = ['North', 'South', 'East', 'West'];\nconst CCY = { North: 'USD', South: 'INR', East: 'EUR', West: 'USD' };\nconst FX = { USD: 1, EUR: 1.08, INR: 0.012 };\nconst DAYS = Array.from({ length: 10 }, (_, i) => '2026-11-' + String(i + 1).padStart(2, '0'));\nconst r2 = x => Math.round(x * 100) / 100;\nconst sumUsd = rows => r2(rows.reduce((t, r) => t + r.amount_usd, 0));\n\n// Seeded faults. Case 0 is a clean control. The agent never sees this table.\nconst CASES = {\n  0: [],\n  1: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true }],\n  2: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  3: [{ type: 'currency_not_converted', region: 'East', dates: ['2026-11-07', '2026-11-08'] }],\n  4: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  5: [{ type: 'partial_load', region: 'West', dates: ['2026-11-03'], logged: false }],\n  6: [{ type: 'currency_not_converted', region: 'South', dates: ['2026-11-09'] }],\n  7: [{ type: 'partial_load', region: 'North', dates: ['2026-11-10'], logged: true },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-04'] }],\n  8: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-02'] },\n      { type: 'duplicate_load', region: 'West', dates: ['2026-11-06'] }],\n  9: [{ type: 'partial_load', region: 'North', dates: ['2026-11-08'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-10'] }],\n  10: [{ type: 'missing_single', region: 'West', dates: ['2026-11-09'], index: 1 }]\n};\n\nfunction loadData(caseId) {\n  const source = [];\n  let n = 1;\n  REGIONS.forEach((region, r) => DAYS.forEach((date, di) => {\n    for (let k = 0; k < 3; k++) {\n      let local = 1000 + ((n * 37 + r * 101 + di * 13) % 900);\n      if (CCY[region] === 'INR') local *= 80;\n      source.push({ order_id: 'ORD-' + String(n).padStart(4, '0'), date, region, currency: CCY[region], amount_local: local, amount_usd: r2(local * FX[CCY[region]]) });\n      n++;\n    }\n  }));\n  const refreshLog = [];\n  REGIONS.forEach(region => DAYS.forEach(date => refreshLog.push({ date, region, status: 'SUCCESS' })));\n  let dashboard = source.map(s => ({ order_id: s.order_id, date: s.date, region: s.region, amount_usd: s.amount_usd }));\n  const localById = {};\n  source.forEach(s => { localById[s.order_id] = s.amount_local; });\n  (CASES[caseId] || []).forEach(f => {\n    const match = row => row.region === f.region && f.dates.includes(row.date);\n    if (f.type === 'partial_load') {\n      dashboard = dashboard.filter(row => !match(row));\n      if (f.logged) refreshLog.forEach(l => { if (l.region === f.region && f.dates.includes(l.date)) l.status = 'FAILED'; });\n    } else if (f.type === 'missing_single') {\n      const victim = source.filter(match)[f.index || 0].order_id;\n      dashboard = dashboard.filter(row => row.order_id !== victim);\n    } else if (f.type === 'duplicate_load') {\n      dashboard = dashboard.flatMap(row => match(row) ? [row, { ...row }] : [row]);\n    } else if (f.type === 'currency_not_converted') {\n      dashboard = dashboard.map(row => match(row) ? { ...row, amount_usd: localById[row.order_id] } : row);\n    }\n  });\n  return { source, dashboard, refreshLog };\n}\n\nfunction parseQuery(query) {\n  const parts = String(query).split('|').map(s => s.trim());\n  return { caseId: Number(parts[0]), arg: parts[1] || '' };\n}\n\n// ---- Tool 1: drill-down by dimension (region, or date within a region) ----\nfunction tool_drill_down(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const bits = (arg || 'region').split(':');\n  const dim = bits[0];\n  const val = bits[1] || '';\n  if (dim !== 'region' && dim !== 'date') return JSON.stringify({ error: 'Input must be \"<case>|region\", \"<case>|date\" or \"<case>|date:<Region>\"' });\n  let s = source, d = dashboard;\n  if (dim === 'date' && val) { s = s.filter(r => r.region === val); d = d.filter(r => r.region === val); }\n  const keys = [...new Set(s.map(r => r[dim]).concat(d.map(r => r[dim])))].sort();\n  const rows = keys.map(k => {\n    const sv = sumUsd(s.filter(r => r[dim] === k));\n    const dv = sumUsd(d.filter(r => r[dim] === k));\n    const o = {}; o[dim] = k; o.source_usd = sv; o.dashboard_usd = dv; o.gap_usd = r2(dv - sv);\n    return o;\n  }).filter(x => Math.abs(x.gap_usd) > 0.005).sort((a, b) => Math.abs(b.gap_usd) - Math.abs(a.gap_usd));\n  const where = (dim === 'date' && val) ? \" WHERE region = '\" + val + \"'\" : '';\n  return JSON.stringify({\n    check: 'drill_down', dimension: dim, filter: (dim === 'date' && val) ? 'region=' + val : null,\n    sql: 'SELECT COALESCE(s.k, d.k) AS ' + dim + ', s.v AS source_usd, d.v AS dashboard_usd, d.v - s.v AS gap_usd FROM (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM source_orders' + where + ' GROUP BY 1) s FULL JOIN (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM dashboard_export' + where + ' GROUP BY 1) d ON s.k = d.k WHERE d.v IS DISTINCT FROM s.v;',\n    groups_checked: keys.length,\n    groups_with_gap: rows,\n    note: rows.length ? 'Only groups with a gap are listed.' : 'No gap in any group for this dimension.'\n  });\n}\n\n// ---- Tool 2: refresh-log check ----\nfunction tool_refresh_log(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { refreshLog } = loadData(caseId);\n  const scoped = arg && arg.toLowerCase() !== 'all';\n  const rows = scoped ? refreshLog.filter(l => l.region === arg) : refreshLog;\n  const bad = rows.filter(l => l.status !== 'SUCCESS');\n  return JSON.stringify({\n    check: 'refresh_log', scope: scoped ? arg : 'all',\n    sql: \"SELECT region, date, status FROM refresh_log WHERE status <> 'SUCCESS'\" + (scoped ? \" AND region = '\" + arg + \"'\" : '') + ';',\n    entries_checked: rows.length,\n    failed_or_partial: bad,\n    note: bad.length ? 'These load jobs did not finish with SUCCESS.' : 'Every load job reports SUCCESS. A SUCCESS status does not prove every row was loaded.'\n  });\n}\n\n// ---- Tool 3: duplicate / missing / value-mismatch record check ----\nfunction tool_record_integrity(query) {\n  const { caseId } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const count = {}, firstDash = {};\n  dashboard.forEach(d => { count[d.order_id] = (count[d.order_id] || 0) + 1; if (!firstDash[d.order_id]) firstDash[d.order_id] = d; });\n  const byKey = rows => {\n    const g = {};\n    rows.forEach(r => { const k = r.region + '|' + r.date; (g[k] = g[k] || []).push(r); });\n    return Object.keys(g).sort().map(k => ({ region: g[k][0].region, date: g[k][0].date, rows: g[k] }));\n  };\n  const ids = rows => rows.slice(0, 10).map(r => r.order_id);\n\n  const missing = source.filter(s => !count[s.order_id]);\n  const duplicated = source.filter(s => count[s.order_id] > 1);\n  const mismatched = source.filter(s => count[s.order_id] && Math.abs(firstDash[s.order_id].amount_usd - s.amount_usd) > 0.01);\n\n  return JSON.stringify({\n    check: 'record_integrity',\n    sql: {\n      missing: 'SELECT s.* FROM source_orders s LEFT JOIN dashboard_export d USING (order_id) WHERE d.order_id IS NULL;',\n      duplicates: 'SELECT order_id, COUNT(*) FROM dashboard_export GROUP BY 1 HAVING COUNT(*) > 1;',\n      value_mismatch: 'SELECT s.order_id, s.amount_usd AS source_usd, d.amount_usd AS dashboard_usd, s.amount_local FROM source_orders s JOIN dashboard_export d USING (order_id) WHERE ABS(s.amount_usd - d.amount_usd) > 0.01;'\n    },\n    source_rows: source.length, dashboard_rows: dashboard.length,\n    missing_rows: byKey(missing).map(g => ({ region: g.region, date: g.date, count: g.rows.length, order_ids: ids(g.rows), total_usd: sumUsd(g.rows) })),\n    duplicate_rows: byKey(duplicated).map(g => ({ region: g.region, date: g.date, orders_duplicated: g.rows.length, order_ids: ids(g.rows), extra_usd: r2(g.rows.reduce((t, r) => t + r.amount_usd * (count[r.order_id] - 1), 0)) })),\n    value_mismatches: byKey(mismatched).map(g => ({\n      region: g.region, date: g.date, count: g.rows.length, currency: g.rows[0].currency, order_ids: ids(g.rows),\n      source_usd: sumUsd(g.rows),\n      dashboard_usd: r2(g.rows.reduce((t, r) => t + firstDash[r.order_id].amount_usd, 0)),\n      dashboard_equals_local_amount: g.rows.every(r => Math.abs(firstDash[r.order_id].amount_usd - r.amount_local) < 0.01)\n    }))\n  });\n}\n\n// ---- Quick check: headline numbers only. The agent does the investigation. ----\nconst caseId = Number($input.first().json.case_id);\nconst { source, dashboard, refreshLog } = loadData(caseId);\nconst sourceTotal = sumUsd(source);\nconst dashboardTotal = sumUsd(dashboard);\nconst gap = r2(dashboardTotal - sourceTotal);\nconst failedJobs = refreshLog.filter(l => l.status !== 'SUCCESS').length;\nconst mismatch = Math.abs(gap) > 0.005 || dashboard.length !== source.length || failedJobs > 0;\nreturn [{ json: {\n  case_id: caseId, mismatch, sourceTotal, dashboardTotal, gap,\n  gapPct: sourceTotal ? r2((gap / sourceTotal) * 100) : 0,\n  sourceRows: source.length, dashboardRows: dashboard.length,\n  startedAt: new Date().toISOString()\n} }];"
+      },
+      "id": "d531602c-805e-4729-9dea-c809af56a7a5",
+      "name": "Quick Check",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        896,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c1",
+              "leftValue": "={{ $json.mismatch }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "1fd50c0e-0497-415b-b80b-c0bb53892a8a",
+      "name": "Mismatch found?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1104,
+        208
+      ]
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=Case ID: {{ $json.case_id }}\nHeadline: source total {{ $json.sourceTotal }} USD, dashboard total {{ $json.dashboardTotal }} USD, gap {{ $json.gap }} USD ({{ $json.gapPct }}%). Source rows: {{ $json.sourceRows }}, dashboard rows: {{ $json.dashboardRows }}.\nInvestigate why they differ.",
+        "options": {
+          "systemMessage": "You are \"Numbers Doctor\", a careful data analyst. A business dashboard does not match its source system. Find out why, using ONLY your three tools.\n\nTool input format: always start with the case id given in the task, then a pipe, then the argument. Examples:\n  drill_down:        \"3|region\"   or   \"3|date:South\"\n  check_refresh_log: \"3|all\"\n  check_record_integrity: \"3|all\"\n\nIMPORTANT: Call exactly ONE tool per turn. Never request several tools at the same time. Wait for each tool result before calling the next tool.\n\nProcedure:\n1. Call drill_down with \"region\" to see which regions have a gap.\n2. For each region with a gap, call drill_down with \"date:<Region>\".\n3. Always call check_record_integrity and check_refresh_log.\n\nDiagnosis rules (use only if the tool evidence supports them):\n- Missing rows AND the refresh log shows FAILED for the same region/date: partial load, the load job failed.\n- Missing rows but the refresh log shows SUCCESS: silent data loss. The cause is NOT proven by the log; say so and use Medium or Low confidence.\n- Duplicate rows: the same batch was loaded twice.\n- Value mismatch where dashboard_equals_local_amount is true: the currency conversion was skipped for those orders.\n- Errors can cancel each other out. If the net gap is smaller than the sum of the individual errors, say so.\n\nStrict rules: never invent numbers or order IDs. Quote only values returned by the tools. If something you cannot check could matter, list it under NOT CHECKED. If there is an unexplained gap, say so and lower your confidence.\n\nAnswer in simple English for a business manager, under 200 words, in exactly this format:\nHEADLINE: one sentence\nFINDINGS: one line per problem found - type, region, date, number of orders, USD effect\nEVIDENCE: up to 3 example order IDs per problem and which tool returned them\nLIKELY CAUSE: one or two sentences\nCONFIDENCE: High, Medium or Low, with a short reason\nNOT CHECKED: what the tools cannot see (for example filters or exchange-rate tables inside the BI tool)\nSUGGESTED ACTION: one or two concrete steps",
+          "maxIterations": 10,
+          "returnIntermediateSteps": true
+        }
+      },
+      "id": "ea6217c5-fee1-4069-82bb-a754b8594fc3",
+      "name": "Numbers Doctor Agent",
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 3.1,
+      "position": [
+        1344,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "modelName": "models/gemini-2.5-flash",
+        "options": {}
+      },
+      "id": "526c4b3b-ad3b-424b-92af-b8579a163190",
+      "name": "Google Gemini Chat Model",
+      "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
+      "typeVersion": 1.2,
+      "position": [
+        1216,
+        288
+      ],
+      "credentials": {
+        "googlePalmApi": {
+          "id": null,
+          "name": "",
+          "__aiGatewayManaged": true
+        }
+      }
+    },
+    {
+      "parameters": {
+        "name": "drill_down",
+        "description": "Compares source vs dashboard totals in USD and lists only the groups with a gap. Input: \"<case_id>|region\" or \"<case_id>|date:<Region>\", e.g. \"3|region\" or \"3|date:South\". Returns the SQL used.",
+        "jsCode": "// ================= Numbers Doctor v2 - shared library =================\n// This exact text is embedded in the n8n Code node and in the three agent tools.\n//\n// DATA ADAPTER CONTRACT: loadData(caseId) must return three arrays:\n//   source:     { order_id, date, region, currency, amount_local, amount_usd }   (system of record)\n//   dashboard:  { order_id, date, region, amount_usd }                           (what the dashboard / BI export shows)\n//   refreshLog: { date, region, status }                                         (load-job log)\n// Default adapter = built-in sample data with seeded faults. Any BI tool that can export CSV\n// (Power BI, Tableau, SAC, Excel) can feed the same three shapes.\n\nconst REGIONS = ['North', 'South', 'East', 'West'];\nconst CCY = { North: 'USD', South: 'INR', East: 'EUR', West: 'USD' };\nconst FX = { USD: 1, EUR: 1.08, INR: 0.012 };\nconst DAYS = Array.from({ length: 10 }, (_, i) => '2026-11-' + String(i + 1).padStart(2, '0'));\nconst r2 = x => Math.round(x * 100) / 100;\nconst sumUsd = rows => r2(rows.reduce((t, r) => t + r.amount_usd, 0));\n\n// Seeded faults. Case 0 is a clean control. The agent never sees this table.\nconst CASES = {\n  0: [],\n  1: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true }],\n  2: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  3: [{ type: 'currency_not_converted', region: 'East', dates: ['2026-11-07', '2026-11-08'] }],\n  4: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  5: [{ type: 'partial_load', region: 'West', dates: ['2026-11-03'], logged: false }],\n  6: [{ type: 'currency_not_converted', region: 'South', dates: ['2026-11-09'] }],\n  7: [{ type: 'partial_load', region: 'North', dates: ['2026-11-10'], logged: true },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-04'] }],\n  8: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-02'] },\n      { type: 'duplicate_load', region: 'West', dates: ['2026-11-06'] }],\n  9: [{ type: 'partial_load', region: 'North', dates: ['2026-11-08'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-10'] }],\n  10: [{ type: 'missing_single', region: 'West', dates: ['2026-11-09'], index: 1 }]\n};\n\nfunction loadData(caseId) {\n  const source = [];\n  let n = 1;\n  REGIONS.forEach((region, r) => DAYS.forEach((date, di) => {\n    for (let k = 0; k < 3; k++) {\n      let local = 1000 + ((n * 37 + r * 101 + di * 13) % 900);\n      if (CCY[region] === 'INR') local *= 80;\n      source.push({ order_id: 'ORD-' + String(n).padStart(4, '0'), date, region, currency: CCY[region], amount_local: local, amount_usd: r2(local * FX[CCY[region]]) });\n      n++;\n    }\n  }));\n  const refreshLog = [];\n  REGIONS.forEach(region => DAYS.forEach(date => refreshLog.push({ date, region, status: 'SUCCESS' })));\n  let dashboard = source.map(s => ({ order_id: s.order_id, date: s.date, region: s.region, amount_usd: s.amount_usd }));\n  const localById = {};\n  source.forEach(s => { localById[s.order_id] = s.amount_local; });\n  (CASES[caseId] || []).forEach(f => {\n    const match = row => row.region === f.region && f.dates.includes(row.date);\n    if (f.type === 'partial_load') {\n      dashboard = dashboard.filter(row => !match(row));\n      if (f.logged) refreshLog.forEach(l => { if (l.region === f.region && f.dates.includes(l.date)) l.status = 'FAILED'; });\n    } else if (f.type === 'missing_single') {\n      const victim = source.filter(match)[f.index || 0].order_id;\n      dashboard = dashboard.filter(row => row.order_id !== victim);\n    } else if (f.type === 'duplicate_load') {\n      dashboard = dashboard.flatMap(row => match(row) ? [row, { ...row }] : [row]);\n    } else if (f.type === 'currency_not_converted') {\n      dashboard = dashboard.map(row => match(row) ? { ...row, amount_usd: localById[row.order_id] } : row);\n    }\n  });\n  return { source, dashboard, refreshLog };\n}\n\nfunction parseQuery(query) {\n  const parts = String(query).split('|').map(s => s.trim());\n  return { caseId: Number(parts[0]), arg: parts[1] || '' };\n}\n\n// ---- Tool 1: drill-down by dimension (region, or date within a region) ----\nfunction tool_drill_down(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const bits = (arg || 'region').split(':');\n  const dim = bits[0];\n  const val = bits[1] || '';\n  if (dim !== 'region' && dim !== 'date') return JSON.stringify({ error: 'Input must be \"<case>|region\", \"<case>|date\" or \"<case>|date:<Region>\"' });\n  let s = source, d = dashboard;\n  if (dim === 'date' && val) { s = s.filter(r => r.region === val); d = d.filter(r => r.region === val); }\n  const keys = [...new Set(s.map(r => r[dim]).concat(d.map(r => r[dim])))].sort();\n  const rows = keys.map(k => {\n    const sv = sumUsd(s.filter(r => r[dim] === k));\n    const dv = sumUsd(d.filter(r => r[dim] === k));\n    const o = {}; o[dim] = k; o.source_usd = sv; o.dashboard_usd = dv; o.gap_usd = r2(dv - sv);\n    return o;\n  }).filter(x => Math.abs(x.gap_usd) > 0.005).sort((a, b) => Math.abs(b.gap_usd) - Math.abs(a.gap_usd));\n  const where = (dim === 'date' && val) ? \" WHERE region = '\" + val + \"'\" : '';\n  return JSON.stringify({\n    check: 'drill_down', dimension: dim, filter: (dim === 'date' && val) ? 'region=' + val : null,\n    sql: 'SELECT COALESCE(s.k, d.k) AS ' + dim + ', s.v AS source_usd, d.v AS dashboard_usd, d.v - s.v AS gap_usd FROM (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM source_orders' + where + ' GROUP BY 1) s FULL JOIN (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM dashboard_export' + where + ' GROUP BY 1) d ON s.k = d.k WHERE d.v IS DISTINCT FROM s.v;',\n    groups_checked: keys.length,\n    groups_with_gap: rows,\n    note: rows.length ? 'Only groups with a gap are listed.' : 'No gap in any group for this dimension.'\n  });\n}\n\n// ---- Tool 2: refresh-log check ----\nfunction tool_refresh_log(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { refreshLog } = loadData(caseId);\n  const scoped = arg && arg.toLowerCase() !== 'all';\n  const rows = scoped ? refreshLog.filter(l => l.region === arg) : refreshLog;\n  const bad = rows.filter(l => l.status !== 'SUCCESS');\n  return JSON.stringify({\n    check: 'refresh_log', scope: scoped ? arg : 'all',\n    sql: \"SELECT region, date, status FROM refresh_log WHERE status <> 'SUCCESS'\" + (scoped ? \" AND region = '\" + arg + \"'\" : '') + ';',\n    entries_checked: rows.length,\n    failed_or_partial: bad,\n    note: bad.length ? 'These load jobs did not finish with SUCCESS.' : 'Every load job reports SUCCESS. A SUCCESS status does not prove every row was loaded.'\n  });\n}\n\n// ---- Tool 3: duplicate / missing / value-mismatch record check ----\nfunction tool_record_integrity(query) {\n  const { caseId } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const count = {}, firstDash = {};\n  dashboard.forEach(d => { count[d.order_id] = (count[d.order_id] || 0) + 1; if (!firstDash[d.order_id]) firstDash[d.order_id] = d; });\n  const byKey = rows => {\n    const g = {};\n    rows.forEach(r => { const k = r.region + '|' + r.date; (g[k] = g[k] || []).push(r); });\n    return Object.keys(g).sort().map(k => ({ region: g[k][0].region, date: g[k][0].date, rows: g[k] }));\n  };\n  const ids = rows => rows.slice(0, 10).map(r => r.order_id);\n\n  const missing = source.filter(s => !count[s.order_id]);\n  const duplicated = source.filter(s => count[s.order_id] > 1);\n  const mismatched = source.filter(s => count[s.order_id] && Math.abs(firstDash[s.order_id].amount_usd - s.amount_usd) > 0.01);\n\n  return JSON.stringify({\n    check: 'record_integrity',\n    sql: {\n      missing: 'SELECT s.* FROM source_orders s LEFT JOIN dashboard_export d USING (order_id) WHERE d.order_id IS NULL;',\n      duplicates: 'SELECT order_id, COUNT(*) FROM dashboard_export GROUP BY 1 HAVING COUNT(*) > 1;',\n      value_mismatch: 'SELECT s.order_id, s.amount_usd AS source_usd, d.amount_usd AS dashboard_usd, s.amount_local FROM source_orders s JOIN dashboard_export d USING (order_id) WHERE ABS(s.amount_usd - d.amount_usd) > 0.01;'\n    },\n    source_rows: source.length, dashboard_rows: dashboard.length,\n    missing_rows: byKey(missing).map(g => ({ region: g.region, date: g.date, count: g.rows.length, order_ids: ids(g.rows), total_usd: sumUsd(g.rows) })),\n    duplicate_rows: byKey(duplicated).map(g => ({ region: g.region, date: g.date, orders_duplicated: g.rows.length, order_ids: ids(g.rows), extra_usd: r2(g.rows.reduce((t, r) => t + r.amount_usd * (count[r.order_id] - 1), 0)) })),\n    value_mismatches: byKey(mismatched).map(g => ({\n      region: g.region, date: g.date, count: g.rows.length, currency: g.rows[0].currency, order_ids: ids(g.rows),\n      source_usd: sumUsd(g.rows),\n      dashboard_usd: r2(g.rows.reduce((t, r) => t + firstDash[r.order_id].amount_usd, 0)),\n      dashboard_equals_local_amount: g.rows.every(r => Math.abs(firstDash[r.order_id].amount_usd - r.amount_local) < 0.01)\n    }))\n  });\n}\n\nreturn tool_drill_down(query);"
+      },
+      "id": "a0b67317-ce4b-4ee6-a3ea-743cc11c40d7",
+      "name": "drill_down",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.1,
+      "position": [
+        1376,
+        304
+      ]
+    },
+    {
+      "parameters": {
+        "name": "check_refresh_log",
+        "description": "Lists data-load jobs that did not finish with SUCCESS. Input: \"<case_id>|all\" or \"<case_id>|<Region>\", e.g. \"3|all\". Returns the SQL used.",
+        "jsCode": "// ================= Numbers Doctor v2 - shared library =================\n// This exact text is embedded in the n8n Code node and in the three agent tools.\n//\n// DATA ADAPTER CONTRACT: loadData(caseId) must return three arrays:\n//   source:     { order_id, date, region, currency, amount_local, amount_usd }   (system of record)\n//   dashboard:  { order_id, date, region, amount_usd }                           (what the dashboard / BI export shows)\n//   refreshLog: { date, region, status }                                         (load-job log)\n// Default adapter = built-in sample data with seeded faults. Any BI tool that can export CSV\n// (Power BI, Tableau, SAC, Excel) can feed the same three shapes.\n\nconst REGIONS = ['North', 'South', 'East', 'West'];\nconst CCY = { North: 'USD', South: 'INR', East: 'EUR', West: 'USD' };\nconst FX = { USD: 1, EUR: 1.08, INR: 0.012 };\nconst DAYS = Array.from({ length: 10 }, (_, i) => '2026-11-' + String(i + 1).padStart(2, '0'));\nconst r2 = x => Math.round(x * 100) / 100;\nconst sumUsd = rows => r2(rows.reduce((t, r) => t + r.amount_usd, 0));\n\n// Seeded faults. Case 0 is a clean control. The agent never sees this table.\nconst CASES = {\n  0: [],\n  1: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true }],\n  2: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  3: [{ type: 'currency_not_converted', region: 'East', dates: ['2026-11-07', '2026-11-08'] }],\n  4: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  5: [{ type: 'partial_load', region: 'West', dates: ['2026-11-03'], logged: false }],\n  6: [{ type: 'currency_not_converted', region: 'South', dates: ['2026-11-09'] }],\n  7: [{ type: 'partial_load', region: 'North', dates: ['2026-11-10'], logged: true },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-04'] }],\n  8: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-02'] },\n      { type: 'duplicate_load', region: 'West', dates: ['2026-11-06'] }],\n  9: [{ type: 'partial_load', region: 'North', dates: ['2026-11-08'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-10'] }],\n  10: [{ type: 'missing_single', region: 'West', dates: ['2026-11-09'], index: 1 }]\n};\n\nfunction loadData(caseId) {\n  const source = [];\n  let n = 1;\n  REGIONS.forEach((region, r) => DAYS.forEach((date, di) => {\n    for (let k = 0; k < 3; k++) {\n      let local = 1000 + ((n * 37 + r * 101 + di * 13) % 900);\n      if (CCY[region] === 'INR') local *= 80;\n      source.push({ order_id: 'ORD-' + String(n).padStart(4, '0'), date, region, currency: CCY[region], amount_local: local, amount_usd: r2(local * FX[CCY[region]]) });\n      n++;\n    }\n  }));\n  const refreshLog = [];\n  REGIONS.forEach(region => DAYS.forEach(date => refreshLog.push({ date, region, status: 'SUCCESS' })));\n  let dashboard = source.map(s => ({ order_id: s.order_id, date: s.date, region: s.region, amount_usd: s.amount_usd }));\n  const localById = {};\n  source.forEach(s => { localById[s.order_id] = s.amount_local; });\n  (CASES[caseId] || []).forEach(f => {\n    const match = row => row.region === f.region && f.dates.includes(row.date);\n    if (f.type === 'partial_load') {\n      dashboard = dashboard.filter(row => !match(row));\n      if (f.logged) refreshLog.forEach(l => { if (l.region === f.region && f.dates.includes(l.date)) l.status = 'FAILED'; });\n    } else if (f.type === 'missing_single') {\n      const victim = source.filter(match)[f.index || 0].order_id;\n      dashboard = dashboard.filter(row => row.order_id !== victim);\n    } else if (f.type === 'duplicate_load') {\n      dashboard = dashboard.flatMap(row => match(row) ? [row, { ...row }] : [row]);\n    } else if (f.type === 'currency_not_converted') {\n      dashboard = dashboard.map(row => match(row) ? { ...row, amount_usd: localById[row.order_id] } : row);\n    }\n  });\n  return { source, dashboard, refreshLog };\n}\n\nfunction parseQuery(query) {\n  const parts = String(query).split('|').map(s => s.trim());\n  return { caseId: Number(parts[0]), arg: parts[1] || '' };\n}\n\n// ---- Tool 1: drill-down by dimension (region, or date within a region) ----\nfunction tool_drill_down(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const bits = (arg || 'region').split(':');\n  const dim = bits[0];\n  const val = bits[1] || '';\n  if (dim !== 'region' && dim !== 'date') return JSON.stringify({ error: 'Input must be \"<case>|region\", \"<case>|date\" or \"<case>|date:<Region>\"' });\n  let s = source, d = dashboard;\n  if (dim === 'date' && val) { s = s.filter(r => r.region === val); d = d.filter(r => r.region === val); }\n  const keys = [...new Set(s.map(r => r[dim]).concat(d.map(r => r[dim])))].sort();\n  const rows = keys.map(k => {\n    const sv = sumUsd(s.filter(r => r[dim] === k));\n    const dv = sumUsd(d.filter(r => r[dim] === k));\n    const o = {}; o[dim] = k; o.source_usd = sv; o.dashboard_usd = dv; o.gap_usd = r2(dv - sv);\n    return o;\n  }).filter(x => Math.abs(x.gap_usd) > 0.005).sort((a, b) => Math.abs(b.gap_usd) - Math.abs(a.gap_usd));\n  const where = (dim === 'date' && val) ? \" WHERE region = '\" + val + \"'\" : '';\n  return JSON.stringify({\n    check: 'drill_down', dimension: dim, filter: (dim === 'date' && val) ? 'region=' + val : null,\n    sql: 'SELECT COALESCE(s.k, d.k) AS ' + dim + ', s.v AS source_usd, d.v AS dashboard_usd, d.v - s.v AS gap_usd FROM (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM source_orders' + where + ' GROUP BY 1) s FULL JOIN (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM dashboard_export' + where + ' GROUP BY 1) d ON s.k = d.k WHERE d.v IS DISTINCT FROM s.v;',\n    groups_checked: keys.length,\n    groups_with_gap: rows,\n    note: rows.length ? 'Only groups with a gap are listed.' : 'No gap in any group for this dimension.'\n  });\n}\n\n// ---- Tool 2: refresh-log check ----\nfunction tool_refresh_log(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { refreshLog } = loadData(caseId);\n  const scoped = arg && arg.toLowerCase() !== 'all';\n  const rows = scoped ? refreshLog.filter(l => l.region === arg) : refreshLog;\n  const bad = rows.filter(l => l.status !== 'SUCCESS');\n  return JSON.stringify({\n    check: 'refresh_log', scope: scoped ? arg : 'all',\n    sql: \"SELECT region, date, status FROM refresh_log WHERE status <> 'SUCCESS'\" + (scoped ? \" AND region = '\" + arg + \"'\" : '') + ';',\n    entries_checked: rows.length,\n    failed_or_partial: bad,\n    note: bad.length ? 'These load jobs did not finish with SUCCESS.' : 'Every load job reports SUCCESS. A SUCCESS status does not prove every row was loaded.'\n  });\n}\n\n// ---- Tool 3: duplicate / missing / value-mismatch record check ----\nfunction tool_record_integrity(query) {\n  const { caseId } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const count = {}, firstDash = {};\n  dashboard.forEach(d => { count[d.order_id] = (count[d.order_id] || 0) + 1; if (!firstDash[d.order_id]) firstDash[d.order_id] = d; });\n  const byKey = rows => {\n    const g = {};\n    rows.forEach(r => { const k = r.region + '|' + r.date; (g[k] = g[k] || []).push(r); });\n    return Object.keys(g).sort().map(k => ({ region: g[k][0].region, date: g[k][0].date, rows: g[k] }));\n  };\n  const ids = rows => rows.slice(0, 10).map(r => r.order_id);\n\n  const missing = source.filter(s => !count[s.order_id]);\n  const duplicated = source.filter(s => count[s.order_id] > 1);\n  const mismatched = source.filter(s => count[s.order_id] && Math.abs(firstDash[s.order_id].amount_usd - s.amount_usd) > 0.01);\n\n  return JSON.stringify({\n    check: 'record_integrity',\n    sql: {\n      missing: 'SELECT s.* FROM source_orders s LEFT JOIN dashboard_export d USING (order_id) WHERE d.order_id IS NULL;',\n      duplicates: 'SELECT order_id, COUNT(*) FROM dashboard_export GROUP BY 1 HAVING COUNT(*) > 1;',\n      value_mismatch: 'SELECT s.order_id, s.amount_usd AS source_usd, d.amount_usd AS dashboard_usd, s.amount_local FROM source_orders s JOIN dashboard_export d USING (order_id) WHERE ABS(s.amount_usd - d.amount_usd) > 0.01;'\n    },\n    source_rows: source.length, dashboard_rows: dashboard.length,\n    missing_rows: byKey(missing).map(g => ({ region: g.region, date: g.date, count: g.rows.length, order_ids: ids(g.rows), total_usd: sumUsd(g.rows) })),\n    duplicate_rows: byKey(duplicated).map(g => ({ region: g.region, date: g.date, orders_duplicated: g.rows.length, order_ids: ids(g.rows), extra_usd: r2(g.rows.reduce((t, r) => t + r.amount_usd * (count[r.order_id] - 1), 0)) })),\n    value_mismatches: byKey(mismatched).map(g => ({\n      region: g.region, date: g.date, count: g.rows.length, currency: g.rows[0].currency, order_ids: ids(g.rows),\n      source_usd: sumUsd(g.rows),\n      dashboard_usd: r2(g.rows.reduce((t, r) => t + firstDash[r.order_id].amount_usd, 0)),\n      dashboard_equals_local_amount: g.rows.every(r => Math.abs(firstDash[r.order_id].amount_usd - r.amount_local) < 0.01)\n    }))\n  });\n}\n\nreturn tool_refresh_log(query);"
+      },
+      "id": "1c207644-0d50-4304-87e0-92279f0c62bc",
+      "name": "check_refresh_log",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.1,
+      "position": [
+        1520,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "name": "check_record_integrity",
+        "description": "Finds missing orders, duplicated orders and orders whose USD value differs between source and dashboard (including whether the dashboard shows the local-currency amount). Input: \"<case_id>|all\", e.g. \"3|all\". Returns order IDs and the SQL used.",
+        "jsCode": "// ================= Numbers Doctor v2 - shared library =================\n// This exact text is embedded in the n8n Code node and in the three agent tools.\n//\n// DATA ADAPTER CONTRACT: loadData(caseId) must return three arrays:\n//   source:     { order_id, date, region, currency, amount_local, amount_usd }   (system of record)\n//   dashboard:  { order_id, date, region, amount_usd }                           (what the dashboard / BI export shows)\n//   refreshLog: { date, region, status }                                         (load-job log)\n// Default adapter = built-in sample data with seeded faults. Any BI tool that can export CSV\n// (Power BI, Tableau, SAC, Excel) can feed the same three shapes.\n\nconst REGIONS = ['North', 'South', 'East', 'West'];\nconst CCY = { North: 'USD', South: 'INR', East: 'EUR', West: 'USD' };\nconst FX = { USD: 1, EUR: 1.08, INR: 0.012 };\nconst DAYS = Array.from({ length: 10 }, (_, i) => '2026-11-' + String(i + 1).padStart(2, '0'));\nconst r2 = x => Math.round(x * 100) / 100;\nconst sumUsd = rows => r2(rows.reduce((t, r) => t + r.amount_usd, 0));\n\n// Seeded faults. Case 0 is a clean control. The agent never sees this table.\nconst CASES = {\n  0: [],\n  1: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true }],\n  2: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  3: [{ type: 'currency_not_converted', region: 'East', dates: ['2026-11-07', '2026-11-08'] }],\n  4: [{ type: 'partial_load', region: 'South', dates: ['2026-11-10'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] }],\n  5: [{ type: 'partial_load', region: 'West', dates: ['2026-11-03'], logged: false }],\n  6: [{ type: 'currency_not_converted', region: 'South', dates: ['2026-11-09'] }],\n  7: [{ type: 'partial_load', region: 'North', dates: ['2026-11-10'], logged: true },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-04'] }],\n  8: [{ type: 'duplicate_load', region: 'East', dates: ['2026-11-02'] },\n      { type: 'duplicate_load', region: 'West', dates: ['2026-11-06'] }],\n  9: [{ type: 'partial_load', region: 'North', dates: ['2026-11-08'], logged: true },\n      { type: 'duplicate_load', region: 'East', dates: ['2026-11-05'] },\n      { type: 'currency_not_converted', region: 'South', dates: ['2026-11-10'] }],\n  10: [{ type: 'missing_single', region: 'West', dates: ['2026-11-09'], index: 1 }]\n};\n\nfunction loadData(caseId) {\n  const source = [];\n  let n = 1;\n  REGIONS.forEach((region, r) => DAYS.forEach((date, di) => {\n    for (let k = 0; k < 3; k++) {\n      let local = 1000 + ((n * 37 + r * 101 + di * 13) % 900);\n      if (CCY[region] === 'INR') local *= 80;\n      source.push({ order_id: 'ORD-' + String(n).padStart(4, '0'), date, region, currency: CCY[region], amount_local: local, amount_usd: r2(local * FX[CCY[region]]) });\n      n++;\n    }\n  }));\n  const refreshLog = [];\n  REGIONS.forEach(region => DAYS.forEach(date => refreshLog.push({ date, region, status: 'SUCCESS' })));\n  let dashboard = source.map(s => ({ order_id: s.order_id, date: s.date, region: s.region, amount_usd: s.amount_usd }));\n  const localById = {};\n  source.forEach(s => { localById[s.order_id] = s.amount_local; });\n  (CASES[caseId] || []).forEach(f => {\n    const match = row => row.region === f.region && f.dates.includes(row.date);\n    if (f.type === 'partial_load') {\n      dashboard = dashboard.filter(row => !match(row));\n      if (f.logged) refreshLog.forEach(l => { if (l.region === f.region && f.dates.includes(l.date)) l.status = 'FAILED'; });\n    } else if (f.type === 'missing_single') {\n      const victim = source.filter(match)[f.index || 0].order_id;\n      dashboard = dashboard.filter(row => row.order_id !== victim);\n    } else if (f.type === 'duplicate_load') {\n      dashboard = dashboard.flatMap(row => match(row) ? [row, { ...row }] : [row]);\n    } else if (f.type === 'currency_not_converted') {\n      dashboard = dashboard.map(row => match(row) ? { ...row, amount_usd: localById[row.order_id] } : row);\n    }\n  });\n  return { source, dashboard, refreshLog };\n}\n\nfunction parseQuery(query) {\n  const parts = String(query).split('|').map(s => s.trim());\n  return { caseId: Number(parts[0]), arg: parts[1] || '' };\n}\n\n// ---- Tool 1: drill-down by dimension (region, or date within a region) ----\nfunction tool_drill_down(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const bits = (arg || 'region').split(':');\n  const dim = bits[0];\n  const val = bits[1] || '';\n  if (dim !== 'region' && dim !== 'date') return JSON.stringify({ error: 'Input must be \"<case>|region\", \"<case>|date\" or \"<case>|date:<Region>\"' });\n  let s = source, d = dashboard;\n  if (dim === 'date' && val) { s = s.filter(r => r.region === val); d = d.filter(r => r.region === val); }\n  const keys = [...new Set(s.map(r => r[dim]).concat(d.map(r => r[dim])))].sort();\n  const rows = keys.map(k => {\n    const sv = sumUsd(s.filter(r => r[dim] === k));\n    const dv = sumUsd(d.filter(r => r[dim] === k));\n    const o = {}; o[dim] = k; o.source_usd = sv; o.dashboard_usd = dv; o.gap_usd = r2(dv - sv);\n    return o;\n  }).filter(x => Math.abs(x.gap_usd) > 0.005).sort((a, b) => Math.abs(b.gap_usd) - Math.abs(a.gap_usd));\n  const where = (dim === 'date' && val) ? \" WHERE region = '\" + val + \"'\" : '';\n  return JSON.stringify({\n    check: 'drill_down', dimension: dim, filter: (dim === 'date' && val) ? 'region=' + val : null,\n    sql: 'SELECT COALESCE(s.k, d.k) AS ' + dim + ', s.v AS source_usd, d.v AS dashboard_usd, d.v - s.v AS gap_usd FROM (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM source_orders' + where + ' GROUP BY 1) s FULL JOIN (SELECT ' + dim + ' AS k, SUM(amount_usd) AS v FROM dashboard_export' + where + ' GROUP BY 1) d ON s.k = d.k WHERE d.v IS DISTINCT FROM s.v;',\n    groups_checked: keys.length,\n    groups_with_gap: rows,\n    note: rows.length ? 'Only groups with a gap are listed.' : 'No gap in any group for this dimension.'\n  });\n}\n\n// ---- Tool 2: refresh-log check ----\nfunction tool_refresh_log(query) {\n  const { caseId, arg } = parseQuery(query);\n  const { refreshLog } = loadData(caseId);\n  const scoped = arg && arg.toLowerCase() !== 'all';\n  const rows = scoped ? refreshLog.filter(l => l.region === arg) : refreshLog;\n  const bad = rows.filter(l => l.status !== 'SUCCESS');\n  return JSON.stringify({\n    check: 'refresh_log', scope: scoped ? arg : 'all',\n    sql: \"SELECT region, date, status FROM refresh_log WHERE status <> 'SUCCESS'\" + (scoped ? \" AND region = '\" + arg + \"'\" : '') + ';',\n    entries_checked: rows.length,\n    failed_or_partial: bad,\n    note: bad.length ? 'These load jobs did not finish with SUCCESS.' : 'Every load job reports SUCCESS. A SUCCESS status does not prove every row was loaded.'\n  });\n}\n\n// ---- Tool 3: duplicate / missing / value-mismatch record check ----\nfunction tool_record_integrity(query) {\n  const { caseId } = parseQuery(query);\n  const { source, dashboard } = loadData(caseId);\n  const count = {}, firstDash = {};\n  dashboard.forEach(d => { count[d.order_id] = (count[d.order_id] || 0) + 1; if (!firstDash[d.order_id]) firstDash[d.order_id] = d; });\n  const byKey = rows => {\n    const g = {};\n    rows.forEach(r => { const k = r.region + '|' + r.date; (g[k] = g[k] || []).push(r); });\n    return Object.keys(g).sort().map(k => ({ region: g[k][0].region, date: g[k][0].date, rows: g[k] }));\n  };\n  const ids = rows => rows.slice(0, 10).map(r => r.order_id);\n\n  const missing = source.filter(s => !count[s.order_id]);\n  const duplicated = source.filter(s => count[s.order_id] > 1);\n  const mismatched = source.filter(s => count[s.order_id] && Math.abs(firstDash[s.order_id].amount_usd - s.amount_usd) > 0.01);\n\n  return JSON.stringify({\n    check: 'record_integrity',\n    sql: {\n      missing: 'SELECT s.* FROM source_orders s LEFT JOIN dashboard_export d USING (order_id) WHERE d.order_id IS NULL;',\n      duplicates: 'SELECT order_id, COUNT(*) FROM dashboard_export GROUP BY 1 HAVING COUNT(*) > 1;',\n      value_mismatch: 'SELECT s.order_id, s.amount_usd AS source_usd, d.amount_usd AS dashboard_usd, s.amount_local FROM source_orders s JOIN dashboard_export d USING (order_id) WHERE ABS(s.amount_usd - d.amount_usd) > 0.01;'\n    },\n    source_rows: source.length, dashboard_rows: dashboard.length,\n    missing_rows: byKey(missing).map(g => ({ region: g.region, date: g.date, count: g.rows.length, order_ids: ids(g.rows), total_usd: sumUsd(g.rows) })),\n    duplicate_rows: byKey(duplicated).map(g => ({ region: g.region, date: g.date, orders_duplicated: g.rows.length, order_ids: ids(g.rows), extra_usd: r2(g.rows.reduce((t, r) => t + r.amount_usd * (count[r.order_id] - 1), 0)) })),\n    value_mismatches: byKey(mismatched).map(g => ({\n      region: g.region, date: g.date, count: g.rows.length, currency: g.rows[0].currency, order_ids: ids(g.rows),\n      source_usd: sumUsd(g.rows),\n      dashboard_usd: r2(g.rows.reduce((t, r) => t + firstDash[r.order_id].amount_usd, 0)),\n      dashboard_equals_local_amount: g.rows.every(r => Math.abs(firstDash[r.order_id].amount_usd - r.amount_local) < 0.01)\n    }))\n  });\n}\n\nreturn tool_record_integrity(query);"
+      },
+      "id": "f7f917bf-715a-4ddc-98d6-8ce76bca4aa4",
+      "name": "check_record_integrity",
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.1,
+      "position": [
+        1680,
+        288
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst q = $('Quick Check').first().json;\nconst secs = Math.round((Date.now() - new Date(q.startedAt).getTime()) / 1000);\nconst steps = $input.first().json.intermediateSteps || [];\nconst calls = steps.map(s => {\n  const a = s.action || {};\n  const inp = a.toolInput && typeof a.toolInput === 'object' ? (a.toolInput.query || a.toolInput.input || JSON.stringify(a.toolInput)) : a.toolInput;\n  return (a.tool || 'tool') + '(\"' + inp + '\")';\n});\nconst report = '🩺 Numbers Doctor - case ' + q.case_id + '\\n\\n' + $input.first().json.output +\n  '\\n\\nTools used: ' + (calls.length ? calls.join(', ') : 'none recorded') +\n  '\\nDiagnosis time: ' + secs + 's';\nreturn [{ json: { case_id: q.case_id, report, diagnosisSeconds: secs, toolCalls: calls.length } }];"
+      },
+      "id": "264a5177-06fe-41ae-b91c-fcf62ebed8d2",
+      "name": "Format Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1776,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "sendAndWait",
+        "sendTo": "pandillanamratha@gmail.com",
+        "subject": "Numbers Doctor: approval needed",
+        "message": "={{ $json.report.replace(/\\n/g, \"<br>\") }}",
+        "approvalOptions": {
+          "values": {
+            "approvalType": "double"
+          }
+        },
+        "options": {}
+      },
+      "id": "dc05d029-561f-4045-b2f4-3f5b949f1fb2",
+      "name": "Send a message",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2000,
+        80
+      ],
+      "webhookId": "3eac9eeb-8022-4deb-a391-e15963616b71",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "akWo0g1u8EHtTr1X",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "c2",
+              "leftValue": "={{ $json.data.approved }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "53484904-586d-4e6f-b3f4-9d95c9cae9dc",
+      "name": "Approved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2208,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "pandillanamratha@gmail.com",
+        "subject": "=[TICKET] Dashboard mismatch - case {{ $(\"Format Report\").item.json.case_id }} - fix required",
+        "message": "=<p><b>New ticket: dashboard numbers do not match the source system.</b></p><p>Case ID: {{ $(\"Format Report\").item.json.case_id }}<br>Approved at: {{ $json.data.respondedAt }}<br>Gap: {{ $(\"Quick Check\").item.json.gap }} USD ({{ $(\"Quick Check\").item.json.gapPct }}%)</p><hr><p>{{ $(\"Format Report\").item.json.report.replace(/\\n/g, \"<br>\") }}</p><hr><p>Please investigate and apply the suggested action, then reply to this email when done.</p>",
+        "options": {}
+      },
+      "id": "36a7f72b-dd14-4ff6-8e65-6bd3ae2685fe",
+      "name": "Create Ticket (Email)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        2496,
+        -16
+      ],
+      "webhookId": "d2a7f8a8-2d2e-4259-a580-7f6d0a8779db",
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "akWo0g1u8EHtTr1X",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "0cdb6696-c6de-4114-8da4-4717eca5cdfd",
+      "name": "Rejected - no action",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        2432,
+        176
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "9811bb9b-0f75-4469-95a4-8bc197f7b805",
+      "name": "All numbers match",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1344,
+        416
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1v7s9khy7M1xG3p3uA6Yp0aLtV3U9fcy5PlVlPOZbWlM",
+          "mode": "list",
+          "cachedResultName": "numbers_doctor_cases",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1v7s9khy7M1xG3p3uA6Yp0aLtV3U9fcy5PlVlPOZbWlM/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 867295948,
+          "mode": "list",
+          "cachedResultName": "dashboard",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/1v7s9khy7M1xG3p3uA6Yp0aLtV3U9fcy5PlVlPOZbWlM/edit#gid=867295948"
+        },
+        "filtersUI": {
+          "values": [
+            {
+              "lookupColumn": "case_id",
+              "lookupValue": "={{ $json.case_id }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        448,
+        208
+      ],
+      "id": "de0c82e6-faee-4974-bfc3-c2654efc5c12",
+      "name": "Get row(s) in sheet",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "tT7FPg8aE7ULYJus",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Pick Case (0-10)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pick Case (0-10)": {
+      "main": [
+        [
+          {
+            "node": "Get row(s) in sheet",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Quick Check": {
+      "main": [
+        [
+          {
+            "node": "Mismatch found?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mismatch found?": {
+      "main": [
+        [
+          {
+            "node": "Numbers Doctor Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "All numbers match",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Numbers Doctor Agent": {
+      "main": [
+        [
+          {
+            "node": "Format Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Google Gemini Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Numbers Doctor Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "drill_down": {
+      "ai_tool": [
+        [
+          {
+            "node": "Numbers Doctor Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_refresh_log": {
+      "ai_tool": [
+        [
+          {
+            "node": "Numbers Doctor Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "check_record_integrity": {
+      "ai_tool": [
+        [
+          {
+            "node": "Numbers Doctor Agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Report": {
+      "main": [
+        [
+          {
+            "node": "Send a message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send a message": {
+      "main": [
+        [
+          {
+            "node": "Approved?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approved?": {
+      "main": [
+        [
+          {
+            "node": "Create Ticket (Email)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Rejected - no action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get row(s) in sheet": {
+      "main": [
+        [
+          {
+            "node": "Quick Check",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "versionId": "2c8a918b-d3b5-4386-b9c5-9a4b1c8ce281",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "94eefec8139794c9773fa153a6d9e7c40e7f76b5098424c7d3ac5ffad73a84b8"
+  },
+  "nodeGroups": [],
+  "id": "UMJoH2hBHFIUAqre",
+  "tags": []
+}
