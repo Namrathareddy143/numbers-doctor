@@ -14,18 +14,13 @@ Business users lose trust in dashboards when numbers don't match the source syst
    - 🕒 **Refresh-log check**: finds stale or failed refreshes
    - 🧾 **Duplicate/missing check**: finds duplicated or missing records
 3. The agent returns a diagnosis **with the evidence** behind it.
-4. A **Telegram approval flow** asks a human to approve before any action is taken.
-
-## Results
-I tested the agent on **[Y] seeded faults** (e.g. stale refresh, duplicate rows, missing rows).
-**Correctly diagnosed: [X] out of [Y] ([X/Y %])**
+4. A **Email approval flow (Approve / Decline)** asks a human to approve before any action is taken.
 
 ## Tech stack
 - n8n (workflow and AI agent)
 - [LLM used, e.g. OpenAI / Gemini]
-- Telegram (approvals)
-- [Data source: CSV / Power BI / SAC]
-
+- Email (approvals)
+- [Data source: Google Sheets
 SAC support is designed as an optional adapter. CSV/Power BI is the default.
 
 ## Demo
@@ -34,7 +29,7 @@ SAC support is designed as an optional adapter. CSV/Power BI is the default.
 
 ## How to run
 1. Import `Numbers Doctor v2 - Dashboard Trust Agent.json` into n8n (*Workflows → Import from file*).
-2. Add your own credentials (LLM API key, Telegram bot).
+2. Add your own credentials (LLM API key, Email bot).
 3. Add the sample data and run the workflow.
 
 ## About me
